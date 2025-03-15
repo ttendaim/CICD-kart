@@ -1,88 +1,96 @@
 pipeline {
-    agent any
+  agent { label 'build' }
+   environment { 
+        registry = "ttendaim/democicd" 
+        registryCredential = 'dockerhub' 
+   }
+   parameters {
+    password(name: 'PASSWD', defaultValue: '', description: 'Please Enter your Gitlab password')
+   }
 
-    tools {
-        maven 'maven3'
-        jdk 'jdk17'
+  stages {
+   stage('Stage I: Build') {
+      steps {
+        git branch: 'main', credentialsId: 'Gitlab', url: 'https://gitlab.com/learndevopseasy/devsecops/springboot-build-pipeline.git'
+        echo "Building Jar Component ..."
+        sh "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64; mvn clean package "
+      }
     }
 
-    environment {
-        SONAR_HOME = tool 'sonar-scanner'
+   stage('Stage II: Code Coverage ') {
+      steps {
+	    echo "Running Code Coverage ..."
+        sh "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64; mvn jacoco:report"
+      }
     }
 
-    stages {
-        stage('Git checkout') {
-            steps {
-                git 'https://github.com/gashok13193/CICD-ekart.git'
-            }
-        }
+   stage('Stage III: SCA') {
+      steps { 
+        echo "Running Software Composition Analysis using OWASP Dependency-Check ..."
+        sh "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64; mvn org.owasp:dependency-check-maven:check"
+      }
+    }
 
-        stage('Code Compile') {
-            steps {
-                sh "mvn clean compile"
-            }
-        }
+   stage('Stage IV: SAST') {
+      steps { 
+        echo "Running Static application security testing using SonarQube Scanner ..."
+        withSonarQubeEnv('mysonarqube') {
+            sh 'mvn sonar:sonar -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml -Dsonar.dependencyCheck.jsonReportPath=target/dependency-check-report.json -Dsonar.dependencyCheck.htmlReportPath=target/dependency-check-report.html -Dsonar.projectName=springboot'
+       }
+      }
+    }
 
-        stage('Unit Testing') {
-            steps {
-                sh "mvn test -Dmaven.test.skip=true"
+   stage('Stage V: QualityGates') {
+      steps { 
+        echo "Running Quality Gates to verify the code quality"
+        script {
+          timeout(time: 1, unit: 'MINUTES') {
+            def qg = waitForQualityGate()
+            if (qg.status != 'OK') {
+              error "Pipeline aborted due to quality gate failure: ${qg.status}"
             }
+           }
         }
-
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh ''' 
-                    $SONAR_HOME/bin/sonar-scanner \
-                    -Dsonar.projectKey=demo \
-                    -Dsonar.projectName=demo \
-                    -Dsonar.java.binaries=target/classes
-                    '''
+      }
+    }
+   
+   stage('Stage VI: Build Image') {
+      steps { 
+        echo "Build Docker Image"
+        script {
+               docker.withRegistry( '', registryCredential ) { 
+                 myImage = docker.build registry + ":$BUILD_NUMBER" 
+                 myImage.push()
                 }
-            }
         }
-
-        stage('OWASP Dependency') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'dependency-check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-
-        stage('Build') {
-            steps {
-                sh "mvn package -Dmaven.test.skip=true"
-            }
-        }
-
-        stage('Deploy to Nexus') {
-            steps {
-                withMaven(globalMavenSettingsConfig: 'global', jdk: 'jdk17', maven: 'maven3', mavenSettingsConfig: '', traceability: true) {
-                    sh "mvn deploy -Dmaven.test.skip=true"
-                }
-            }
-        }
-
-        stage('Docker Build and Tag') {
-            steps {
-                withDockerRegistry(credentialsId: 'fcaaed4a-5678-4547-b3dc-06eb5605ef83', url: 'https://index.docker.io/v1/') {
-                    sh "docker build -t gashok13193/cicd-ekart:latest -f docker/Dockerfile ."
-                }
-            }
-        }
-
-        stage('Trivy Scan') {
-            steps {
-                sh "trivy image gashok13193/cicd-ekart:latest > trivy-report.txt"
-            }
-        }
-
-        stage('Docker Push') {
-            steps {
-                withDockerRegistry(credentialsId: 'fcaaed4a-5678-4547-b3dc-06eb5605ef83', url: 'https://index.docker.io/v1/') {
-                    sh "docker push gashok13193/cicd-ekart:latest"
-                }
-            }
+      }
+    }
+        
+   stage('Stage VII: Scan Image ') {
+      steps { 
+        echo "Scanning Image for Vulnerabilities"
+        sh "trivy image --scanners vuln --offline-scan ttendaim/democicd:$BUILD_NUMBER > trivyresults.txt"
         }
     }
+          
+   stage('Stage VIII: Smoke Test ') {
+      steps { 
+        echo "Smoke Test the Image"
+        sh "docker run -d --name smokerun -p 8080:8080 ttendaim/democicd:$BUILD_NUMBER"
+        sh "sleep 90; ./check.sh"
+        sh "docker rm --force smokerun"
+        }
+    }
+
+   stage('Stage IX: Trigger Deployment'){
+      steps { 
+       script {
+        TAG = "$BUILD_NUMBER"
+         echo "Trigger CD Pipeline"
+          build wait: false, job: 'springboot-cd-pipeline', parameters: [password(name: 'PASSWD', description: 'Please Enter your Gitlab password', value: params.PASSWD),string(name: 'IMAGETAG', value: TAG)]
+       }
+      }
+    }
+   
+  }
 }
